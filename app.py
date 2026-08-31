@@ -46,7 +46,9 @@ def get_japanese_holidays(dates):
 
 
 def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール'):
-  df_raw = pd.read_excel(excel_bytes, sheet_name=sheet_name, header=None)
+  # io.BytesIO でラップして pandas に渡すように修正
+  excel_file = io.BytesIO(excel_bytes)
+  df_raw = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
 
   req_min = {
       'WEEKDAY_EARLY': 2,
@@ -94,8 +96,9 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
       header_row_idx = idx
       break
 
+  excel_file.seek(0)
   df_staff = pd.read_excel(
-      excel_bytes, sheet_name=sheet_name, skiprows=header_row_idx
+      excel_file, sheet_name=sheet_name, skiprows=header_row_idx
   )
   df_staff.columns = [str(c).strip() for c in df_staff.columns]
 
@@ -170,7 +173,10 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
 # ------------------------------------------------------------
 def generate_shift_from_bytes(excel_bytes):
   rules = load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
-  df_cal = pd.read_excel(excel_bytes, sheet_name='カレンダー入力', header=None)
+
+  # io.BytesIO でラップして pandas に渡すように修正
+  excel_file = io.BytesIO(excel_bytes)
+  df_cal = pd.read_excel(excel_file, sheet_name='カレンダー入力', header=None)
 
   holiday_requests, extra_work = {}, {}
   dates_list = []
