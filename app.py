@@ -187,27 +187,56 @@ def generate_shift_from_bytes(excel_bytes):
   excel_file = io.BytesIO(excel_bytes)
 
   # カレンダー入力シートの読み込み（シート名の揺れに対応）
-  try:
-    df_cal = pd.read_excel(excel_file, sheet_name='カレンダー入力', header=None)
-  except Exception:
-    excel_file.seek(0)
-    df_cal = pd.read_excel(
-        excel_file, sheet_name='7月カレンダー入力', header=None
-    )
+  cal_sheet_name = 'カレンダー入力'
+  xl_obj = pd.ExcelFile(excel_file)
+  for s_name in xl_obj.sheet_names:
+    if 'カレンダー' in s_name:
+      cal_sheet_name = s_name
+      break
+
+  excel_file.seek(0)
+  df_cal = pd.read_excel(excel_file, sheet_name=cal_sheet_name, header=None)
 
   holiday_requests, extra_work = {}, {}
   dates_list = []
 
-  # 【研修不具合の自動修正】スタッフ名と列番号を自動対応付け
+  # ヘッダー行（スタッフ名が書かれている行）を探索
+  header_row_idx = None
   staff_cols = {}
-  for c_idx in range(4, len(df_cal.columns)):
-    header_val = str(df_cal.iloc[3, c_idx]).strip()
+  for r_idx in range(min(15, len(df_cal))):
+    row_str_vals = [
+        str(val).strip() for val in df_cal.iloc[r_idx].values if pd.notna(val)
+    ]
+    # スタッフ名が含まれている行を探す
     for s_name in rules['STAFF']:
-      if s_name in header_val or header_val in s_name:
-        staff_cols[s_name] = c_idx
+      if any(s_name in v for v in row_str_vals):
+        header_row_idx = r_idx
+        break
+    if header_row_idx is not None:
+      break
 
-  for r in range(4, len(df_cal)):
-    d_val = df_cal.iloc[r, 3]
+  if header_row_idx is not None:
+    for c_idx in range(len(df_cal.columns)):
+      val = str(df_cal.iloc[header_row_idx, c_idx]).strip()
+      for s_name in rules['STAFF']:
+        if s_name in val or val in s_name:
+          staff_cols[s_name] = c_idx
+
+  # 日付列の探索（左側3〜5列目周辺から日付を探す）
+  date_col_idx = 3
+  for c_idx in range(min(5, len(df_cal.columns))):
+    col_vals = df_cal.iloc[:, c_idx].dropna().tolist()
+    for v in col_vals:
+      try:
+        parse_date_flexible(v)
+        date_col_idx = c_idx
+        break
+      except Exception:
+        continue
+
+  start_row = (header_row_idx + 1) if header_row_idx is not None else 4
+  for r in range(start_row, len(df_cal)):
+    d_val = df_cal.iloc[r, date_col_idx]
     if pd.isna(d_val) or str(d_val).strip() in ['', 'nan', 'None']:
       continue
     try:
@@ -226,10 +255,11 @@ def generate_shift_from_bytes(excel_bytes):
             if pd.notna(df_cal.iloc[r, col_idx])
             else ''
         )
+        # 研修の文字列チェック（「研」「研修」など柔軟に読み込み）
         if cell_val in ['公休', '休', '希望休', '×']:
           holiday_requests[d_str].append(s_name)
-        elif cell_val in ['研', '研修']:
-          extra_work[d_str].append(s_name)  # 研修を確実に収集
+        elif '研' in cell_val:
+          extra_work[d_str].append(s_name)
 
   dates_list.sort()
   dates = [
