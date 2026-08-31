@@ -9,7 +9,7 @@ WEEKDAYS_JP = ['月', '火', '水', '木', '金', '土', '日']
 
 
 # ------------------------------------------------------------
-# 日付・設定読み込み処理
+# 共通ヘルパー関数
 # ------------------------------------------------------------
 def weekday_name(d):
   return WEEKDAYS_JP[d.weekday()]
@@ -45,54 +45,69 @@ def get_japanese_holidays(dates):
   return {d for d in dates if d in all_holidays}
 
 
+def is_maru(val):
+  """'○', '〇', 'o', 'O' などの記号を判定"""
+  if pd.isna(val):
+    return False
+  s = str(val).strip()
+  return s in ['○', '〇', 'o', 'O', '1', 'True']
+
+
+# ------------------------------------------------------------
+# Excel設定読み込み処理
+# ------------------------------------------------------------
 def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール'):
-  # io.BytesIO でラップして pandas に渡すように修正
   excel_file = io.BytesIO(excel_bytes)
   df_raw = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
 
-  req_min = {
-      'WEEKDAY_EARLY': 2,
-      'WEEKDAY_LATE': 2,
-      'SATURDAY': 3,
-      'SUNDAY': 2,
-      'UNQUAL_MON': 1,
-      'UNQUAL_TUE': 1,
-      'UNQUAL_WED': 1,
-      'UNQUAL_THU': 1,
-      'UNQUAL_FRI': 1,
-      'UNQUAL_SAT': 1,
-      'UNQUAL_SUN': 1,
-  }
-
   col_map = {'月': 3, '火': 4, '水': 5, '木': 6, '金': 7, '土': 8, '日': 9}
+
+  # 必要人数の初期化（曜日ごとの辞書構造）
+  req_min = {
+      'QUALIFIED_TOTAL': {w: 0 for w in WEEKDAYS_JP},
+      'QUALIFIED_EARLY': {w: None for w in WEEKDAYS_JP},  # Noneは「早遅指定なし」
+      'QUALIFIED_LATE': {w: None for w in WEEKDAYS_JP},
+      'UNQUALIFIED': {w: 0 for w in WEEKDAYS_JP},
+  }
 
   for r in range(len(df_raw)):
     label = str(df_raw.iloc[r, 1]).strip() if pd.notna(df_raw.iloc[r, 1]) else ''
-    if '平日早番' in label and pd.notna(df_raw.iloc[r, 3]):
-      req_min['WEEKDAY_EARLY'] = int(df_raw.iloc[r, 3])
-    elif '平日遅番' in label and pd.notna(df_raw.iloc[r, 3]):
-      req_min['WEEKDAY_LATE'] = int(df_raw.iloc[r, 3])
-    elif (
-        '土曜' in label
-        and 'うち' not in label
-        and pd.notna(df_raw.iloc[r, col_map['土']])
-    ):
-      req_min['SATURDAY'] = int(df_raw.iloc[r, col_map['土']])
-    elif (
-        '日曜' in label
-        and 'うち' not in label
-        and pd.notna(df_raw.iloc[r, col_map['日']])
-    ):
-      req_min['SUNDAY'] = int(df_raw.iloc[r, col_map['日']])
+
+    if '資格者合計' in label:
+      for w_key, col_i in col_map.items():
+        if col_i < len(df_raw.columns) and pd.notna(df_raw.iloc[r, col_i]):
+          try:
+            req_min['QUALIFIED_TOTAL'][w_key] = int(df_raw.iloc[r, col_i])
+          except ValueError:
+            pass
+
+    elif 'うち資格者早番' in label:
+      for w_key, col_i in col_map.items():
+        if col_i < len(df_raw.columns) and pd.notna(df_raw.iloc[r, col_i]):
+          val_str = str(df_raw.iloc[r, col_i]).strip()
+          if val_str.isdigit():
+            req_min['QUALIFIED_EARLY'][w_key] = int(val_str)
+
+    elif 'うち資格者遅番' in label:
+      for w_key, col_i in col_map.items():
+        if col_i < len(df_raw.columns) and pd.notna(df_raw.iloc[r, col_i]):
+          val_str = str(df_raw.iloc[r, col_i]).strip()
+          if val_str.isdigit():
+            req_min['QUALIFIED_LATE'][w_key] = int(val_str)
+
     elif '一般スタッフ' in label:
       for w_key, col_i in col_map.items():
         if col_i < len(df_raw.columns) and pd.notna(df_raw.iloc[r, col_i]):
-          key_name = f"UNQUAL_{'MON' if w_key=='月' else 'TUE' if w_key=='火' else 'WED' if w_key=='水' else 'THU' if w_key=='木' else 'FRI' if w_key=='金' else 'SAT' if w_key=='土' else 'SUN'}"
-          req_min[key_name] = int(df_raw.iloc[r, col_i])
+          try:
+            req_min['UNQUALIFIED'][w_key] = int(df_raw.iloc[r, col_i])
+          except ValueError:
+            pass
 
+  # スタッフ一覧ヘッダー行の検索
   header_row_idx = None
   for idx, row in df_raw.iterrows():
-    if 'スタッフ一覧' in [str(v).strip() for v in row.values if pd.notna(v)]:
+    row_vals = [str(v).strip() for v in row.values if pd.notna(v)]
+    if 'スタッフ一覧' in row_vals or 'スタッフ' in row_vals:
       header_row_idx = idx
       break
 
@@ -102,16 +117,17 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
   )
   df_staff.columns = [str(c).strip() for c in df_staff.columns]
 
+  # 列名の特定
   staff_col = [c for c in df_staff.columns if 'スタッフ' in c][0]
   type_col = [c for c in df_staff.columns if '区分' in c][0]
   job_col = [c for c in df_staff.columns if '職業' in c][0]
-  time_col = [c for c in df_staff.columns if '時間帯' in c][0]
-  days_col = [c for c in df_staff.columns if '出勤可能日' in c][0]
+  early_col = [c for c in df_staff.columns if '早番' in c][0]
+  late_col = [c for c in df_staff.columns if '遅番' in c][0]
   max_c_col = [c for c in df_staff.columns if '最大連勤' in c][0]
 
   staff_list, full_time, part_time = [], [], []
   qualified_staff, unqualified_staff = [], []
-  early_staff, late_staff, sat_staff, sun_staff = [], [], [], []
+  early_staff, late_staff = [], []
   fixed_holidays, max_consecutive = {}, {}
 
   for _, row in df_staff.iterrows():
@@ -120,34 +136,35 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
       continue
     staff_list.append(s_val)
 
+    # 区分（正社員／パート）
     if '正社員' in str(row[type_col]):
       full_time.append(s_val)
     else:
       part_time.append(s_val)
 
+    # 資格（資格者／一般）
     job = str(row[job_col]).strip()
     if any(q in job for q in ['薬剤師', '登録販売者', '資格者']):
       qualified_staff.append(s_val)
     else:
       unqualified_staff.append(s_val)
 
-    t_band = str(row[time_col]).strip()
-    if '早番' in t_band:
+    # 時間帯（○が付いているものを可能とする）
+    if is_maru(row[early_col]):
       early_staff.append(s_val)
-    elif '遅番' in t_band:
+    if is_maru(row[late_col]):
       late_staff.append(s_val)
 
-    w_days = [
-        d.strip()
-        for d in str(row[days_col]).replace('、', ',').split(',')
-        if d.strip()
-    ]
-    fixed_holidays[s_val] = [d for d in WEEKDAYS_JP if d not in w_days]
-    if '土' in w_days:
-      sat_staff.append(s_val)
-    if '日' in w_days:
-      sun_staff.append(s_val)
+    # 曜日ごとの出勤可能日（○がついていない曜日は固定休日）
+    off_days = []
+    for w_key in WEEKDAYS_JP:
+      w_cols = [c for c in df_staff.columns if c == w_key]
+      if w_cols:
+        if not is_maru(row[w_cols[0]]):
+          off_days.append(w_key)
+    fixed_holidays[s_val] = off_days
 
+    # 最大連勤数
     mc = str(row[max_c_col]).strip()
     if mc.isdigit():
       max_consecutive[s_val] = int(mc)
@@ -160,8 +177,6 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
       'UNQUALIFIED_STAFF': unqualified_staff,
       'EARLY_STAFF': early_staff,
       'LATE_STAFF': late_staff,
-      'SATURDAY_STAFF': sat_staff,
-      'SUNDAY_STAFF': sun_staff,
       'FIXED_HOLIDAYS': fixed_holidays,
       'MAX_CONSECUTIVE': max_consecutive,
       'REQ_MIN': req_min,
@@ -169,28 +184,31 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
 
 
 # ------------------------------------------------------------
-# シフト生成処理
+# シフト最適化計算処理
 # ------------------------------------------------------------
 def generate_shift_from_bytes(excel_bytes):
   rules = load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
-
-  # io.BytesIO でラップして pandas に渡すように修正
   excel_file = io.BytesIO(excel_bytes)
-  df_cal = pd.read_excel(excel_file, sheet_name='カレンダー入力', header=None)
+
+  # カレンダー入力シートの読み込み
+  try:
+    df_cal = pd.read_excel(excel_file, sheet_name='カレンダー入力', header=None)
+  except Exception:
+    excel_file.seek(0)
+    df_cal = pd.read_excel(
+        excel_file, sheet_name='7月カレンダー入力', header=None
+    )
 
   holiday_requests, extra_work = {}, {}
   dates_list = []
-  staff_cols = {
-      '①': 5,
-      '②': 6,
-      '③': 7,
-      '④': 8,
-      '⑤': 9,
-      '⑥': 10,
-      '⑦': 11,
-      '⑧': 12,
-      '⑨': 13,
-  }
+
+  # スタッフ名と列の対応付け（5列目以降から一致するスタッフを探す）
+  staff_cols = {}
+  for c_idx in range(4, len(df_cal.columns)):
+    header_val = str(df_cal.iloc[3, c_idx]).strip()
+    for s_name in rules['STAFF']:
+      if s_name in header_val or header_val in s_name:
+        staff_cols[s_name] = c_idx
 
   for r in range(4, len(df_cal)):
     d_val = df_cal.iloc[r, 3]
@@ -234,6 +252,7 @@ def generate_shift_from_bytes(excel_bytes):
   deficiency_q_vars, deficiency_unqual_vars = {}, {}
   penalty_terms = []
 
+  # 1. 休日・出勤条件の設定
   for d in dates:
     w_name = weekday_name(d)
     is_j_holiday = d in jp_holidays
@@ -249,12 +268,13 @@ def generate_shift_from_bytes(excel_bytes):
           model.Add(shifts[(s, d)] == 0)
         else:
           model.Add(shifts[(s, d)] == 1)
-      else:
+      else:  # 正社員
         if is_extra:
           model.Add(shifts[(s, d)] == 1)
         elif is_req_off or is_j_holiday or is_fixed_off:
           model.Add(shifts[(s, d)] == 0)
 
+  # 2. 公休数の確保（正社員）
   off_days_fulltime = {s: 10 for s in rules['FULL_TIME']}
   for s in rules['FULL_TIME']:
     req_off = off_days_fulltime.get(s, 10)
@@ -262,6 +282,7 @@ def generate_shift_from_bytes(excel_bytes):
     model.Add(total_off >= req_off)
     penalty_terms.append(total_off * 10)
 
+  # 3. 最大連勤制限
   for s, max_c in rules['MAX_CONSECUTIVE'].items():
     for i in range(len(dates) - max_c):
       model.Add(
@@ -271,80 +292,48 @@ def generate_shift_from_bytes(excel_bytes):
   def eff_shift(s, d):
     return 0 if s in extra_work.get(d.strftime('%Y-%m-%d'), []) else shifts[(s, d)]
 
+  # 4. 人数要件のチェック（資格者）
   req = rules['REQ_MIN']
   q_set = set(rules['QUALIFIED_STAFF'])
 
   for d in dates:
     w_name, d_str = weekday_name(d), d.strftime('%Y-%m-%d')
-    if d not in jp_holidays:
-      if w_name in ['月', '火', '水', '木', '金']:
-        early_q = [
-            s
-            for s in rules['EARLY_STAFF']
-            if s in q_set and s in rules['STAFF']
-        ]
-        def_early = model.NewIntVar(
-            0, req['WEEKDAY_EARLY'], f'def_early_{d_str}'
-        )
+    req_tot = req['QUALIFIED_TOTAL'].get(w_name, 0)
+    req_early = req['QUALIFIED_EARLY'].get(w_name)
+    req_late = req['QUALIFIED_LATE'].get(w_name)
+
+    if d not in jp_holidays and req_tot > 0:
+      # 全体としての資格者数
+      all_q = [s for s in rules['STAFF'] if s in q_set]
+      def_tot = model.NewIntVar(0, req_tot, f'def_q_tot_{d_str}')
+      model.Add(sum(eff_shift(s, d) for s in all_q) + def_tot >= req_tot)
+      penalty_terms.append(def_tot * 1000)
+
+      # 早番が指定されている場合
+      if req_early is not None:
+        early_q = [s for s in rules['EARLY_STAFF'] if s in q_set]
+        def_early = model.NewIntVar(0, req_early, f'def_q_early_{d_str}')
         model.Add(
-            sum(eff_shift(s, d) for s in early_q) + def_early
-            >= req['WEEKDAY_EARLY']
+            sum(eff_shift(s, d) for s in early_q) + def_early >= req_early
         )
-        deficiency_q_vars[(d, 'early')] = def_early
         penalty_terms.append(def_early * 1000)
 
-        late_q = [
-            s for s in rules['LATE_STAFF'] if s in q_set and s in rules['STAFF']
-        ]
-        def_late = model.NewIntVar(0, req['WEEKDAY_LATE'], f'def_late_{d_str}')
-        model.Add(
-            sum(eff_shift(s, d) for s in late_q) + def_late
-            >= req['WEEKDAY_LATE']
-        )
-        deficiency_q_vars[(d, 'late')] = def_late
+      # 遅番が指定されている場合
+      if req_late is not None:
+        late_q = [s for s in rules['LATE_STAFF'] if s in q_set]
+        def_late = model.NewIntVar(0, req_late, f'def_q_late_{d_str}')
+        model.Add(sum(eff_shift(s, d) for s in late_q) + def_late >= req_late)
         penalty_terms.append(def_late * 1000)
 
-      elif w_name == '土':
-        sat_q = [
-            s
-            for s in rules['SATURDAY_STAFF']
-            if s in q_set and s in rules['STAFF']
-        ]
-        def_sat = model.NewIntVar(0, req['SATURDAY'], f'def_sat_{d_str}')
-        model.Add(
-            sum(eff_shift(s, d) for s in sat_q) + def_sat >= req['SATURDAY']
-        )
-        deficiency_q_vars[(d, 'sat')] = def_sat
-        penalty_terms.append(def_sat * 1000)
+      deficiency_q_vars[d] = def_tot
 
-      elif w_name == '日':
-        sun_q = [
-            s for s in rules['SUNDAY_STAFF'] if s in q_set and s in rules['STAFF']
-        ]
-        def_sun = model.NewIntVar(0, req['SUNDAY'], f'def_sun_{d_str}')
-        model.Add(
-            sum(eff_shift(s, d) for s in sun_q) + def_sun >= req['SUNDAY']
-        )
-        deficiency_q_vars[(d, 'sun')] = def_sun
-        penalty_terms.append(def_sun * 1000)
-
+  # 5. 人数要件のチェック（一般スタッフ）
   unqualified = rules['UNQUALIFIED_STAFF']
-  w_map = {
-      '月': 'MON',
-      '火': 'TUE',
-      '水': 'WED',
-      '木': 'THU',
-      '金': 'FRI',
-      '土': 'SAT',
-      '日': 'SUN',
-  }
-
   for d in dates:
     w_name, d_str = weekday_name(d), d.strftime('%Y-%m-%d')
-    req_key = f'UNQUAL_{w_map[w_name]}'
-    req_unqual_num = req.get(req_key, 1)
+    req_unqual_num = req['UNQUALIFIED'].get(w_name, 0)
 
-    if d not in jp_holidays and unqualified:
+    if d not in jp_holidays and req_unqual_num > 0 and unqualified:
       def_unqual = model.NewIntVar(0, req_unqual_num, f'def_unqual_{d_str}')
       model.Add(
           sum(eff_shift(s, d) for s in unqualified) + def_unqual
@@ -374,12 +363,24 @@ def generate_shift_from_bytes(excel_bytes):
           if s in extra_work.get(d_str, []):
             row.append('研')
           else:
-            t = (
-                '早'
-                if s in rules['EARLY_STAFF']
-                else ('遅' if s in rules['LATE_STAFF'] else '出')
-            )
-            row.append(t)
+            w_name = weekday_name(d)
+            req_early = req['QUALIFIED_EARLY'].get(w_name)
+            req_late = req['QUALIFIED_LATE'].get(w_name)
+
+            # 早遅のくくりがある曜日の場合
+            if req_early is not None or req_late is not None:
+              is_e = s in rules['EARLY_STAFF']
+              is_l = s in rules['LATE_STAFF']
+              if is_e and is_l:
+                row.append('出')  # 両方可なら「出」
+              elif is_e:
+                row.append('早')
+              elif is_l:
+                row.append('遅')
+              else:
+                row.append('出')
+            else:
+              row.append('出')  # くくりがない曜日は全員「出」
         else:
           off_count += 1
           if (
@@ -394,12 +395,9 @@ def generate_shift_from_bytes(excel_bytes):
 
     def_q_row, def_unqual_row = [], []
     for d in dates:
-      q_defs = [
-          solver.Value(var)
-          for key, var in deficiency_q_vars.items()
-          if key[0] == d
-      ]
-      tot_q_def = sum(q_defs) if q_defs else 0
+      tot_q_def = (
+          solver.Value(deficiency_q_vars[d]) if d in deficiency_q_vars else 0
+      )
       def_q_row.append(f'-{tot_q_def}人' if tot_q_def > 0 else '0')
 
       unqual_def = (
@@ -439,7 +437,6 @@ if uploaded_file is not None:
           st.success('✅ シフトが完成しました！')
           st.dataframe(result_df, use_container_width=True)
 
-          # Excelダウンロード用データの生成
           output = io.BytesIO()
           with pd.ExcelWriter(output, engine='openpyxl') as writer:
             result_df.to_excel(writer, sheet_name='完成シフト')
