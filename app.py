@@ -252,6 +252,7 @@ def generate_shift_from_bytes(excel_bytes):
       dates_list[0] + timedelta(days=i)
       for i in range((dates_list[-1] - dates_list[0]).days + 1)
   ]
+  num_days = len(dates)
   jp_holidays = get_japanese_holidays(dates)
 
   model = cp_model.CpModel()
@@ -264,7 +265,7 @@ def generate_shift_from_bytes(excel_bytes):
 
   penalty_terms = []
 
-  # 1. 基本割り当て規則（厳密順守）
+  # 1. 基本割り当て規則
   for d in dates:
     w_name = weekday_name(d)
     is_j_holiday = d in jp_holidays
@@ -285,7 +286,7 @@ def generate_shift_from_bytes(excel_bytes):
         continue
 
       # 出勤の場合の可能な枠
-      allowed = []
+      allowed = [0]  # 破綻を防ぐため、常に「休み(0)」を選択肢として許容する
       if can_early:
         allowed.append(1)
       if can_late:
@@ -293,13 +294,16 @@ def generate_shift_from_bytes(excel_bytes):
       if not can_early and not can_late:
         allowed.append(3)
 
-      # 固定出勤日でない場合は休み(0)も選択肢に含める
-      if not is_fixed_work and not is_extra:
-        allowed.append(0)
-
       model.AddAllowedAssignments([shifts[(s, d)]], [(v,) for v in allowed])
 
-  # 2. 正社員公休の制御（固定出勤と矛盾しない厳密適用）
+      # 固定出勤日なのに休んだ場合はペナルティを課す（絶対不可ではなく優先努力目標にする）
+      if is_fixed_work and not is_extra:
+        is_off_fixed = model.NewBoolVar(f'off_fixed_{s}_{d_str}')
+        model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_off_fixed)
+        model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_off_fixed.Not())
+        penalty_terms.append(is_off_fixed * 500)
+
+  # 2. 正社員公休の制御（10日を目標とし、不足分・超過分をペナルティ化）
   for s in rules['FULL_TIME']:
     is_off_vars = []
     for d in dates:
@@ -308,8 +312,7 @@ def generate_shift_from_bytes(excel_bytes):
       model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_off.Not())
       is_off_vars.append(is_off)
 
-    # 10日公休を目標とし、不足分のみペナルティ化（出勤上限オーバーによる破綻を回避）
-    off_defic = model.NewIntVar(0, 10, f'off_defic_{s}')
+    off_defic = model.NewIntVar(0, num_days, f'off_defic_{s}')
     model.Add(sum(is_off_vars) + off_defic >= 10)
     penalty_terms.append(off_defic * 100)
 
