@@ -99,7 +99,6 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
           except ValueError:
             pass
 
-  # スタッフ一覧ヘッダー行の特定
   header_row_idx = None
   for idx, row in df_raw.iterrows():
     row_vals = [str(v).strip() for v in row.values if pd.notna(v)]
@@ -146,7 +145,7 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
     if len(row) > 5 and is_maru(row.iloc[5]):
       late_staff.append(s_val)
 
-    # 各曜日の出勤可能・休み判定 (列6=月, 7=火, 8=水, 9=木, 10=金, 11=土, 12=日)
+    # 曜日列 (列6=月, 7=火, 8=水, 9=木, 10=金, 11=土, 12=日)
     w_indices = {
         '月': 6,
         '火': 7,
@@ -156,8 +155,7 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
         '土': 11,
         '日': 12,
     }
-    off_days = []
-    work_days = []
+    off_days, work_days = [], []
 
     for w_key, col_i in w_indices.items():
       if col_i < len(row):
@@ -258,7 +256,7 @@ def generate_shift_from_bytes(excel_bytes):
 
   model = cp_model.CpModel()
 
-  # シフト変数を「早番(1)」「遅番(2)」「その他の出勤(3)」「休み(0)」に明確化
+  # シフト変数 (0:休み, 1:早番, 2:遅番, 3:通常出勤)
   shifts = {}
   for s in rules['STAFF']:
     for d in dates:
@@ -266,7 +264,7 @@ def generate_shift_from_bytes(excel_bytes):
 
   penalty_terms = []
 
-  # 1. 基本制約（出勤・公休）
+  # 1. 基本割り当て規則（厳密順守）
   for d in dates:
     w_name = weekday_name(d)
     is_j_holiday = d in jp_holidays
@@ -281,43 +279,28 @@ def generate_shift_from_bytes(excel_bytes):
       can_early = s in rules['EARLY_STAFF']
       can_late = s in rules['LATE_STAFF']
 
-      # 勤務可能区分の設定
-      allowed_shifts = [0]
-      if not (
-          (is_req_off or is_j_holiday or is_fixed_off)
-          and not is_extra
-          and s in rules['PART_TIME']
-      ) and not (
-          (is_req_off or is_j_holiday or is_fixed_off) and not is_extra
-      ):
-        if can_early:
-          allowed_shifts.append(1)
-        if can_late:
-          allowed_shifts.append(2)
-        if not can_early and not can_late:
-          allowed_shifts.append(3)
+      # 休み確定（希望休、祝日、固定休日）※研修が入っている場合を除く
+      if (is_req_off or is_j_holiday or is_fixed_off) and not is_extra:
+        model.Add(shifts[(s, d)] == 0)
+        continue
 
-      if is_extra:
-        allowed_shifts = [1, 2, 3]
+      # 出勤の場合の可能な枠
+      allowed = []
+      if can_early:
+        allowed.append(1)
+      if can_late:
+        allowed.append(2)
+      if not can_early and not can_late:
+        allowed.append(3)
 
-      # 固定出勤日の場合は休み(0)を除外
-      if is_fixed_work and not is_req_off and not is_j_holiday:
-        if 0 in allowed_shifts:
-          allowed_shifts.remove(0)
+      # 固定出勤日でない場合は休み(0)も選択肢に含める
+      if not is_fixed_work and not is_extra:
+        allowed.append(0)
 
-      # 休みリクエストがある場合は0のみ
-      if is_req_off or is_j_holiday or (is_fixed_off and not is_extra):
-        allowed_shifts = [0]
+      model.AddAllowedAssignments([shifts[(s, d)]], [(v,) for v in allowed])
 
-      if not allowed_shifts:
-        allowed_shifts = [0]
-
-      model.AddAllowedAssignments([shifts[(s, d)]], [(v,) for v in allowed_shifts])
-
-  # 2. 正社員公休
-  off_days_fulltime = {s: 10 for s in rules['FULL_TIME']}
+  # 2. 正社員公休の制御（固定出勤と矛盾しない厳密適用）
   for s in rules['FULL_TIME']:
-    req_off = off_days_fulltime.get(s, 10)
     is_off_vars = []
     for d in dates:
       is_off = model.NewBoolVar(f'is_off_{s}_{d}')
@@ -325,10 +308,12 @@ def generate_shift_from_bytes(excel_bytes):
       model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_off.Not())
       is_off_vars.append(is_off)
 
-    total_off = sum(is_off_vars)
-    model.Add(total_off >= req_off)
+    # 10日公休を目標とし、不足分のみペナルティ化（出勤上限オーバーによる破綻を回避）
+    off_defic = model.NewIntVar(0, 10, f'off_defic_{s}')
+    model.Add(sum(is_off_vars) + off_defic >= 10)
+    penalty_terms.append(off_defic * 100)
 
-  # 3. 連勤上限
+  # 3. 連勤上限の厳密適用
   for s, max_c in rules['MAX_CONSECUTIVE'].items():
     for i in range(len(dates) - max_c):
       work_vars = []
@@ -340,7 +325,7 @@ def generate_shift_from_bytes(excel_bytes):
         work_vars.append(is_w)
       model.Add(sum(work_vars) <= max_c)
 
-  # 4. 人員充足カウント
+  # 4. 人員充足カウント（不足人数の算出）
   req = rules['REQ_MIN']
   q_set = set(rules['QUALIFIED_STAFF'])
   deficiency_q_vars, deficiency_unqual_vars = {}, {}
@@ -353,7 +338,7 @@ def generate_shift_from_bytes(excel_bytes):
 
     all_q = [s for s in rules['STAFF'] if s in q_set]
 
-    # 合計
+    # 資格者合計
     q_work_vars = []
     for s in all_q:
       if s not in extra_work.get(d_str, []):
@@ -362,7 +347,7 @@ def generate_shift_from_bytes(excel_bytes):
         model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_w.Not())
         q_work_vars.append(is_w)
 
-    def_tot = model.NewIntVar(0, max(req_tot, 10), f'def_q_tot_{d_str}')
+    def_tot = model.NewIntVar(0, 20, f'def_q_tot_{d_str}')
     model.Add(sum(q_work_vars) + def_tot >= req_tot)
     penalty_terms.append(def_tot * 1000)
     deficiency_q_vars[d] = def_tot
@@ -376,7 +361,7 @@ def generate_shift_from_bytes(excel_bytes):
           model.Add(shifts[(s, d)] == 1).OnlyEnforceIf(is_e)
           model.Add(shifts[(s, d)] != 1).OnlyEnforceIf(is_e.Not())
           e_vars.append(is_e)
-      def_e = model.NewIntVar(0, req_early, f'def_q_e_{d_str}')
+      def_e = model.NewIntVar(0, 20, f'def_q_e_{d_str}')
       model.Add(sum(e_vars) + def_e >= req_early)
       penalty_terms.append(def_e * 1000)
 
@@ -389,7 +374,7 @@ def generate_shift_from_bytes(excel_bytes):
           model.Add(shifts[(s, d)] == 2).OnlyEnforceIf(is_l)
           model.Add(shifts[(s, d)] != 2).OnlyEnforceIf(is_l.Not())
           l_vars.append(is_l)
-      def_l = model.NewIntVar(0, req_late, f'def_q_l_{d_str}')
+      def_l = model.NewIntVar(0, 20, f'def_q_l_{d_str}')
       model.Add(sum(l_vars) + def_l >= req_late)
       penalty_terms.append(def_l * 1000)
 
@@ -408,9 +393,7 @@ def generate_shift_from_bytes(excel_bytes):
           model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_w.Not())
           unq_vars.append(is_w)
 
-    def_unqual = model.NewIntVar(
-        0, max(req_unqual_num, 10), f'def_unqual_{d_str}'
-    )
+    def_unqual = model.NewIntVar(0, 20, f'def_unqual_{d_str}')
     model.Add(sum(unq_vars) + def_unqual >= req_unqual_num)
     deficiency_unqual_vars[d] = def_unqual
     penalty_terms.append(def_unqual * 1000)
@@ -427,7 +410,6 @@ def generate_shift_from_bytes(excel_bytes):
     for s in rules['STAFF']:
       row = []
       total_off = sum(1 for d in dates if solver.Value(shifts[(s, d)]) == 0)
-      req_off = off_days_fulltime.get(s, 10)
       off_count = 0
 
       for d in dates:
@@ -445,11 +427,7 @@ def generate_shift_from_bytes(excel_bytes):
             row.append('出')
         else:
           off_count += 1
-          if (
-              s in rules['FULL_TIME']
-              and total_off > req_off
-              and off_count > req_off
-          ):
+          if s in rules['FULL_TIME'] and total_off > 10 and off_count > 10:
             row.append('有休')
           else:
             row.append('休')
