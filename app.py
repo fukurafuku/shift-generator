@@ -56,6 +56,7 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
   excel_file = io.BytesIO(excel_bytes)
   df_raw = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
 
+  # 曜日列のインデックス特定（月=3, 火=4, 水=5, 木=6, 金=7, 土=8, 日=9）
   col_map = {'月': 3, '火': 4, '水': 5, '木': 6, '金': 7, '土': 8, '日': 9}
 
   req_min = {
@@ -98,6 +99,7 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
           except ValueError:
             pass
 
+  # スタッフ一覧ヘッダー行の特定
   header_row_idx = None
   for idx, row in df_raw.iterrows():
     row_vals = [str(v).strip() for v in row.values if pd.notna(v)]
@@ -112,62 +114,65 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
 
   excel_file.seek(0)
   df_staff = pd.read_excel(
-      excel_file, sheet_name=sheet_name, skiprows=header_row_idx
+      excel_file, sheet_name=sheet_name, skiprows=header_row_idx, header=None
   )
-  df_staff.columns = [str(c).strip() for c in df_staff.columns]
-
-  def find_col(keywords, default_idx=0):
-    for kw in keywords:
-      cols = [c for c in df_staff.columns if kw in c]
-      if cols:
-        return cols[0]
-    return df_staff.columns[min(default_idx, len(df_staff.columns) - 1)]
-
-  staff_col = find_col(['スタッフ', '名前', '氏名'], 1)
-  type_col = find_col(['区分', '雇用'], 2)
-  job_col = find_col(['職業', '資格', '職種'], 3)
-  early_col = find_col(['早番'], 4)
-  late_col = find_col(['遅番'], 5)
-  max_c_col = find_col(['最大連勤', '連勤'], 13)
 
   staff_list, full_time, part_time = [], [], []
   qualified_staff, unqualified_staff = [], []
   early_staff, late_staff = [], []
-  fixed_holidays, max_consecutive = {}, {}
+  fixed_holidays, fixed_workdays = {}, {}
+  max_consecutive = {}
 
   for _, row in df_staff.iterrows():
-    s_val = str(row[staff_col]).strip()
-    if not s_val or s_val in ['nan', 'None', '', 'スタッフ名']:
+    s_val = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ''
+    if not s_val or s_val in ['nan', 'None', '', 'スタッフ名', '名前', '氏名']:
       continue
     staff_list.append(s_val)
 
-    if '正社員' in str(row[type_col]):
+    type_val = str(row.iloc[2]) if len(row) > 2 and pd.notna(row.iloc[2]) else ''
+    if '正社員' in type_val:
       full_time.append(s_val)
     else:
       part_time.append(s_val)
 
-    job = str(row[job_col]).strip()
-    if any(q in job for q in ['薬剤師', '登録販売者', '資格者']):
+    job_val = str(row.iloc[3]) if len(row) > 3 and pd.notna(row.iloc[3]) else ''
+    if any(q in job_val for q in ['薬剤師', '登録販売者', '資格者']):
       qualified_staff.append(s_val)
     else:
       unqualified_staff.append(s_val)
 
-    if is_maru(row[early_col]):
+    if len(row) > 4 and is_maru(row.iloc[4]):
       early_staff.append(s_val)
-    if is_maru(row[late_col]):
+    if len(row) > 5 and is_maru(row.iloc[5]):
       late_staff.append(s_val)
 
+    # 各曜日の出勤可能・休み判定 (列6=月, 7=火, 8=水, 9=木, 10=金, 11=土, 12=日)
+    w_indices = {
+        '月': 6,
+        '火': 7,
+        '水': 8,
+        '木': 9,
+        '金': 10,
+        '土': 11,
+        '日': 12,
+    }
     off_days = []
-    for w_key in WEEKDAYS_JP:
-      w_cols = [c for c in df_staff.columns if c == w_key]
-      if w_cols:
-        if not is_maru(row[w_cols[0]]):
-          off_days.append(w_key)
-    fixed_holidays[s_val] = off_days
+    work_days = []
 
-    mc = str(row[max_c_col]).strip()
-    if mc.isdigit():
-      max_consecutive[s_val] = int(mc)
+    for w_key, col_i in w_indices.items():
+      if col_i < len(row):
+        if is_maru(row.iloc[col_i]):
+          work_days.append(w_key)
+        else:
+          off_days.append(w_key)
+
+    fixed_holidays[s_val] = off_days
+    fixed_workdays[s_val] = work_days
+
+    if len(row) > 13 and pd.notna(row.iloc[13]):
+      mc = str(row.iloc[13]).strip()
+      if mc.isdigit():
+        max_consecutive[s_val] = int(mc)
 
   return {
       'STAFF': staff_list,
@@ -178,6 +183,7 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
       'EARLY_STAFF': early_staff,
       'LATE_STAFF': late_staff,
       'FIXED_HOLIDAYS': fixed_holidays,
+      'FIXED_WORKDAYS': fixed_workdays,
       'MAX_CONSECUTIVE': max_consecutive,
       'REQ_MIN': req_min,
   }
@@ -270,11 +276,12 @@ def generate_shift_from_bytes(excel_bytes):
       is_extra = s in extra_work.get(d_str, [])
       is_req_off = s in holiday_requests.get(d_str, [])
       is_fixed_off = w_name in rules['FIXED_HOLIDAYS'].get(s, [])
+      is_fixed_work = w_name in rules['FIXED_WORKDAYS'].get(s, [])
 
       can_early = s in rules['EARLY_STAFF']
       can_late = s in rules['LATE_STAFF']
 
-      # 勤務区分の制限
+      # 勤務可能区分の設定
       allowed_shifts = [0]
       if not (
           (is_req_off or is_j_holiday or is_fixed_off)
@@ -292,6 +299,18 @@ def generate_shift_from_bytes(excel_bytes):
 
       if is_extra:
         allowed_shifts = [1, 2, 3]
+
+      # 固定出勤日の場合は休み(0)を除外
+      if is_fixed_work and not is_req_off and not is_j_holiday:
+        if 0 in allowed_shifts:
+          allowed_shifts.remove(0)
+
+      # 休みリクエストがある場合は0のみ
+      if is_req_off or is_j_holiday or (is_fixed_off and not is_extra):
+        allowed_shifts = [0]
+
+      if not allowed_shifts:
+        allowed_shifts = [0]
 
       model.AddAllowedAssignments([shifts[(s, d)]], [(v,) for v in allowed_shifts])
 
@@ -332,49 +351,47 @@ def generate_shift_from_bytes(excel_bytes):
     req_early = req['QUALIFIED_EARLY'].get(w_name)
     req_late = req['QUALIFIED_LATE'].get(w_name)
 
-    if d not in jp_holidays:
-      all_q = [s for s in rules['STAFF'] if s in q_set]
+    all_q = [s for s in rules['STAFF'] if s in q_set]
 
-      # 合計
-      q_work_vars = []
+    # 合計
+    q_work_vars = []
+    for s in all_q:
+      if s not in extra_work.get(d_str, []):
+        is_w = model.NewBoolVar(f'qw_{s}_{d_str}')
+        model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_w)
+        model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_w.Not())
+        q_work_vars.append(is_w)
+
+    def_tot = model.NewIntVar(0, max(req_tot, 10), f'def_q_tot_{d_str}')
+    model.Add(sum(q_work_vars) + def_tot >= req_tot)
+    penalty_terms.append(def_tot * 1000)
+    deficiency_q_vars[d] = def_tot
+
+    # 早番
+    if req_early is not None:
+      e_vars = []
       for s in all_q:
         if s not in extra_work.get(d_str, []):
-          is_w = model.NewBoolVar(f'qw_{s}_{d_str}')
-          model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_w)
-          model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_w.Not())
-          q_work_vars.append(is_w)
+          is_e = model.NewBoolVar(f'qe_{s}_{d_str}')
+          model.Add(shifts[(s, d)] == 1).OnlyEnforceIf(is_e)
+          model.Add(shifts[(s, d)] != 1).OnlyEnforceIf(is_e.Not())
+          e_vars.append(is_e)
+      def_e = model.NewIntVar(0, req_early, f'def_q_e_{d_str}')
+      model.Add(sum(e_vars) + def_e >= req_early)
+      penalty_terms.append(def_e * 1000)
 
-      if req_tot > 0:
-        def_tot = model.NewIntVar(0, req_tot, f'def_q_tot_{d_str}')
-        model.Add(sum(q_work_vars) + def_tot >= req_tot)
-        penalty_terms.append(def_tot * 1000)
-        deficiency_q_vars[d] = def_tot
-
-      # 早番
-      if req_early is not None:
-        e_vars = []
-        for s in all_q:
-          if s not in extra_work.get(d_str, []):
-            is_e = model.NewBoolVar(f'qe_{s}_{d_str}')
-            model.Add(shifts[(s, d)] == 1).OnlyEnforceIf(is_e)
-            model.Add(shifts[(s, d)] != 1).OnlyEnforceIf(is_e.Not())
-            e_vars.append(is_e)
-        def_e = model.NewIntVar(0, req_early, f'def_q_e_{d_str}')
-        model.Add(sum(e_vars) + def_e >= req_early)
-        penalty_terms.append(def_e * 1000)
-
-      # 遅番
-      if req_late is not None:
-        l_vars = []
-        for s in all_q:
-          if s not in extra_work.get(d_str, []):
-            is_l = model.NewBoolVar(f'ql_{s}_{d_str}')
-            model.Add(shifts[(s, d)] == 2).OnlyEnforceIf(is_l)
-            model.Add(shifts[(s, d)] != 2).OnlyEnforceIf(is_l.Not())
-            l_vars.append(is_l)
-        def_l = model.NewIntVar(0, req_late, f'def_q_l_{d_str}')
-        model.Add(sum(l_vars) + def_l >= req_late)
-        penalty_terms.append(def_l * 1000)
+    # 遅番
+    if req_late is not None:
+      l_vars = []
+      for s in all_q:
+        if s not in extra_work.get(d_str, []):
+          is_l = model.NewBoolVar(f'ql_{s}_{d_str}')
+          model.Add(shifts[(s, d)] == 2).OnlyEnforceIf(is_l)
+          model.Add(shifts[(s, d)] != 2).OnlyEnforceIf(is_l.Not())
+          l_vars.append(is_l)
+      def_l = model.NewIntVar(0, req_late, f'def_q_l_{d_str}')
+      model.Add(sum(l_vars) + def_l >= req_late)
+      penalty_terms.append(def_l * 1000)
 
   # 5. 一般スタッフ
   unqualified = rules['UNQUALIFIED_STAFF']
@@ -382,8 +399,8 @@ def generate_shift_from_bytes(excel_bytes):
     w_name, d_str = weekday_name(d), d.strftime('%Y-%m-%d')
     req_unqual_num = req['UNQUALIFIED'].get(w_name, 0)
 
-    if d not in jp_holidays and req_unqual_num > 0 and unqualified:
-      unq_vars = []
+    unq_vars = []
+    if unqualified:
       for s in unqualified:
         if s not in extra_work.get(d_str, []):
           is_w = model.NewBoolVar(f'unq_{s}_{d_str}')
@@ -391,10 +408,12 @@ def generate_shift_from_bytes(excel_bytes):
           model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_w.Not())
           unq_vars.append(is_w)
 
-      def_unqual = model.NewIntVar(0, req_unqual_num, f'def_unqual_{d_str}')
-      model.Add(sum(unq_vars) + def_unqual >= req_unqual_num)
-      deficiency_unqual_vars[d] = def_unqual
-      penalty_terms.append(def_unqual * 1000)
+    def_unqual = model.NewIntVar(
+        0, max(req_unqual_num, 10), f'def_unqual_{d_str}'
+    )
+    model.Add(sum(unq_vars) + def_unqual >= req_unqual_num)
+    deficiency_unqual_vars[d] = def_unqual
+    penalty_terms.append(def_unqual * 1000)
 
   if penalty_terms:
     model.Minimize(sum(penalty_terms))
