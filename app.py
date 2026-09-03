@@ -98,7 +98,6 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
           except ValueError:
             pass
 
-  # スタッフ一覧ヘッダー行の検索
   header_row_idx = None
   for idx, row in df_raw.iterrows():
     row_vals = [str(v).strip() for v in row.values if pd.notna(v)]
@@ -109,7 +108,7 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
       break
 
   if header_row_idx is None:
-    header_row_idx = 8  # デフォルト位置
+    header_row_idx = 8
 
   excel_file.seek(0)
   df_staff = pd.read_excel(
@@ -117,7 +116,6 @@ def load_fixed_rules_from_excel_bytes(excel_bytes, sheet_name='固定ルール')
   )
   df_staff.columns = [str(c).strip() for c in df_staff.columns]
 
-  # 安全な列特定
   def find_col(keywords, default_idx=0):
     for kw in keywords:
       cols = [c for c in df_staff.columns if kw in c]
@@ -194,7 +192,6 @@ def generate_shift_from_bytes(excel_bytes):
   excel_file = io.BytesIO(excel_bytes)
   xl_obj = pd.ExcelFile(excel_file)
 
-  # 「カレンダー入力」シートを自動認識
   cal_sheet_name = 'カレンダー入力'
   for s_name in xl_obj.sheet_names:
     if 'カレンダー' in s_name:
@@ -207,7 +204,6 @@ def generate_shift_from_bytes(excel_bytes):
   holiday_requests, extra_work = {}, {}
   dates_list = []
 
-  # 画像の構造に基づき、行4（インデックス4）からスタッフ名マップを作成
   staff_cols = {}
   for c_idx in range(len(df_cal.columns)):
     for r_idx in range(2, 6):
@@ -217,7 +213,6 @@ def generate_shift_from_bytes(excel_bytes):
           if s_name and (s_name in cell_val or cell_val in s_name):
             staff_cols[s_name] = c_idx
 
-  # 日付は D列（インデックス 3）
   date_col_idx = 3
 
   for r in range(4, len(df_cal)):
@@ -243,7 +238,7 @@ def generate_shift_from_bytes(excel_bytes):
         if cell_val in ['公休', '休', '希望休', '×']:
           holiday_requests[d_str].append(s_name)
         elif '研' in cell_val:
-          extra_work[d_str].append(s_name)  # 「研修」「研」を確実に抽出
+          extra_work[d_str].append(s_name)
 
   dates_list = sorted(list(set(dates_list)))
   if not dates_list:
@@ -256,16 +251,16 @@ def generate_shift_from_bytes(excel_bytes):
   jp_holidays = get_japanese_holidays(dates)
 
   model = cp_model.CpModel()
-  shifts = {
-      (s, d): model.NewBoolVar(f'shift_{s}_{d}')
-      for s in rules['STAFF']
-      for d in dates
-  }
 
-  deficiency_q_vars, deficiency_unqual_vars = {}, {}
+  # シフト変数を「早番(1)」「遅番(2)」「その他の出勤(3)」「休み(0)」に明確化
+  shifts = {}
+  for s in rules['STAFF']:
+    for d in dates:
+      shifts[(s, d)] = model.NewIntVar(0, 3, f'shift_{s}_{d}')
+
   penalty_terms = []
 
-  # 1. 出勤・公休・研修条件
+  # 1. 基本制約（出勤・公休）
   for d in dates:
     w_name = weekday_name(d)
     is_j_holiday = d in jp_holidays
@@ -276,39 +271,60 @@ def generate_shift_from_bytes(excel_bytes):
       is_req_off = s in holiday_requests.get(d_str, [])
       is_fixed_off = w_name in rules['FIXED_HOLIDAYS'].get(s, [])
 
-      if s in rules['PART_TIME']:
-        if (is_j_holiday or is_fixed_off or is_req_off) and not is_extra:
-          model.Add(shifts[(s, d)] == 0)
-        else:
-          model.Add(shifts[(s, d)] == 1)
-      else:  # 正社員
-        if is_extra:
-          model.Add(shifts[(s, d)] == 1)
-        elif is_req_off or is_j_holiday or is_fixed_off:
-          model.Add(shifts[(s, d)] == 0)
+      can_early = s in rules['EARLY_STAFF']
+      can_late = s in rules['LATE_STAFF']
+
+      # 勤務区分の制限
+      allowed_shifts = [0]
+      if not (
+          (is_req_off or is_j_holiday or is_fixed_off)
+          and not is_extra
+          and s in rules['PART_TIME']
+      ) and not (
+          (is_req_off or is_j_holiday or is_fixed_off) and not is_extra
+      ):
+        if can_early:
+          allowed_shifts.append(1)
+        if can_late:
+          allowed_shifts.append(2)
+        if not can_early and not can_late:
+          allowed_shifts.append(3)
+
+      if is_extra:
+        allowed_shifts = [1, 2, 3]
+
+      model.AddAllowedAssignments([shifts[(s, d)]], [(v,) for v in allowed_shifts])
 
   # 2. 正社員公休
   off_days_fulltime = {s: 10 for s in rules['FULL_TIME']}
   for s in rules['FULL_TIME']:
     req_off = off_days_fulltime.get(s, 10)
-    total_off = sum(1 - shifts[(s, d)] for d in dates)
+    is_off_vars = []
+    for d in dates:
+      is_off = model.NewBoolVar(f'is_off_{s}_{d}')
+      model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_off)
+      model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_off.Not())
+      is_off_vars.append(is_off)
+
+    total_off = sum(is_off_vars)
     model.Add(total_off >= req_off)
-    penalty_terms.append(total_off * 10)
 
   # 3. 連勤上限
   for s, max_c in rules['MAX_CONSECUTIVE'].items():
     for i in range(len(dates) - max_c):
-      model.Add(
-          sum(shifts[(s, dates[i + j])] for j in range(max_c + 1)) <= max_c
-      )
+      work_vars = []
+      for j in range(max_c + 1):
+        d_target = dates[i + j]
+        is_w = model.NewBoolVar(f'is_w_{s}_{d_target}')
+        model.Add(shifts[(s, d_target)] != 0).OnlyEnforceIf(is_w)
+        model.Add(shifts[(s, d_target)] == 0).OnlyEnforceIf(is_w.Not())
+        work_vars.append(is_w)
+      model.Add(sum(work_vars) <= max_c)
 
-  # 研修の人は店舗人員カウントから除外（eff_shift）
-  def eff_shift(s, d):
-    return 0 if s in extra_work.get(d.strftime('%Y-%m-%d'), []) else shifts[(s, d)]
-
-  # 4. 資格者人員のカウント
+  # 4. 人員充足カウント
   req = rules['REQ_MIN']
   q_set = set(rules['QUALIFIED_STAFF'])
+  deficiency_q_vars, deficiency_unqual_vars = {}, {}
 
   for d in dates:
     w_name, d_str = weekday_name(d), d.strftime('%Y-%m-%d')
@@ -316,40 +332,67 @@ def generate_shift_from_bytes(excel_bytes):
     req_early = req['QUALIFIED_EARLY'].get(w_name)
     req_late = req['QUALIFIED_LATE'].get(w_name)
 
-    if d not in jp_holidays and req_tot > 0:
+    if d not in jp_holidays:
       all_q = [s for s in rules['STAFF'] if s in q_set]
-      def_tot = model.NewIntVar(0, req_tot, f'def_q_tot_{d_str}')
-      model.Add(sum(eff_shift(s, d) for s in all_q) + def_tot >= req_tot)
-      penalty_terms.append(def_tot * 1000)
 
+      # 合計
+      q_work_vars = []
+      for s in all_q:
+        if s not in extra_work.get(d_str, []):
+          is_w = model.NewBoolVar(f'qw_{s}_{d_str}')
+          model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_w)
+          model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_w.Not())
+          q_work_vars.append(is_w)
+
+      if req_tot > 0:
+        def_tot = model.NewIntVar(0, req_tot, f'def_q_tot_{d_str}')
+        model.Add(sum(q_work_vars) + def_tot >= req_tot)
+        penalty_terms.append(def_tot * 1000)
+        deficiency_q_vars[d] = def_tot
+
+      # 早番
       if req_early is not None:
-        early_q = [s for s in rules['EARLY_STAFF'] if s in q_set]
-        def_early = model.NewIntVar(0, req_early, f'def_q_early_{d_str}')
-        model.Add(
-            sum(eff_shift(s, d) for s in early_q) + def_early >= req_early
-        )
-        penalty_terms.append(def_early * 1000)
+        e_vars = []
+        for s in all_q:
+          if s not in extra_work.get(d_str, []):
+            is_e = model.NewBoolVar(f'qe_{s}_{d_str}')
+            model.Add(shifts[(s, d)] == 1).OnlyEnforceIf(is_e)
+            model.Add(shifts[(s, d)] != 1).OnlyEnforceIf(is_e.Not())
+            e_vars.append(is_e)
+        def_e = model.NewIntVar(0, req_early, f'def_q_e_{d_str}')
+        model.Add(sum(e_vars) + def_e >= req_early)
+        penalty_terms.append(def_e * 1000)
 
+      # 遅番
       if req_late is not None:
-        late_q = [s for s in rules['LATE_STAFF'] if s in q_set]
-        def_late = model.NewIntVar(0, req_late, f'def_q_late_{d_str}')
-        model.Add(sum(eff_shift(s, d) for s in late_q) + def_late >= req_late)
-        penalty_terms.append(def_late * 1000)
+        l_vars = []
+        for s in all_q:
+          if s not in extra_work.get(d_str, []):
+            is_l = model.NewBoolVar(f'ql_{s}_{d_str}')
+            model.Add(shifts[(s, d)] == 2).OnlyEnforceIf(is_l)
+            model.Add(shifts[(s, d)] != 2).OnlyEnforceIf(is_l.Not())
+            l_vars.append(is_l)
+        def_l = model.NewIntVar(0, req_late, f'def_q_l_{d_str}')
+        model.Add(sum(l_vars) + def_l >= req_late)
+        penalty_terms.append(def_l * 1000)
 
-      deficiency_q_vars[d] = def_tot
-
-  # 5. 一般スタッフ人員のカウント
+  # 5. 一般スタッフ
   unqualified = rules['UNQUALIFIED_STAFF']
   for d in dates:
     w_name, d_str = weekday_name(d), d.strftime('%Y-%m-%d')
     req_unqual_num = req['UNQUALIFIED'].get(w_name, 0)
 
     if d not in jp_holidays and req_unqual_num > 0 and unqualified:
+      unq_vars = []
+      for s in unqualified:
+        if s not in extra_work.get(d_str, []):
+          is_w = model.NewBoolVar(f'unq_{s}_{d_str}')
+          model.Add(shifts[(s, d)] != 0).OnlyEnforceIf(is_w)
+          model.Add(shifts[(s, d)] == 0).OnlyEnforceIf(is_w.Not())
+          unq_vars.append(is_w)
+
       def_unqual = model.NewIntVar(0, req_unqual_num, f'def_unqual_{d_str}')
-      model.Add(
-          sum(eff_shift(s, d) for s in unqualified) + def_unqual
-          >= req_unqual_num
-      )
+      model.Add(sum(unq_vars) + def_unqual >= req_unqual_num)
       deficiency_unqual_vars[d] = def_unqual
       penalty_terms.append(def_unqual * 1000)
 
@@ -370,27 +413,17 @@ def generate_shift_from_bytes(excel_bytes):
 
       for d in dates:
         d_str = d.strftime('%Y-%m-%d')
-        if solver.Value(shifts[(s, d)]) == 1:
-          if s in extra_work.get(d_str, []):
-            row.append('研')  # 研修日は「研」を出力
-          else:
-            w_name = weekday_name(d)
-            req_early = req['QUALIFIED_EARLY'].get(w_name)
-            req_late = req['QUALIFIED_LATE'].get(w_name)
+        val = solver.Value(shifts[(s, d)])
 
-            if req_early is not None or req_late is not None:
-              is_e = s in rules['EARLY_STAFF']
-              is_l = s in rules['LATE_STAFF']
-              if is_e and is_l:
-                row.append('出')
-              elif is_e:
-                row.append('早')
-              elif is_l:
-                row.append('遅')
-              else:
-                row.append('出')
-            else:
-              row.append('出')
+        if val != 0:
+          if s in extra_work.get(d_str, []):
+            row.append('研')
+          elif val == 1:
+            row.append('早')
+          elif val == 2:
+            row.append('遅')
+          else:
+            row.append('出')
         else:
           off_count += 1
           if (
