@@ -362,8 +362,8 @@ def generate_shift(
     return None
 
 
-# --- 装飾付きExcelバイナリ生成関数（Streamlitダウンロード用） ---
-def get_colored_excel_bytes(df):
+# --- 装飾付きExcelバイナリ生成関数 ---
+def create_colored_excel_bytes(df):
     wb = Workbook()
     ws = wb.active
     ws.title = "シフト表"
@@ -371,13 +371,13 @@ def get_colored_excel_bytes(df):
     # 色の定義
     fill_early = PatternFill(
         start_color="FFE6CC", end_color="FFE6CC", fill_type="solid"
-    )  # 薄いオレンジ（早）
+    )
     fill_late = PatternFill(
         start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"
-    )  # 薄い紺/ソフトブルー（遅）
+    )
     fill_work = PatternFill(
         start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"
-    )  # 薄い緑（出）
+    )
 
     # ヘッダー書き込み
     headers = ["スタッフ / 日付"] + list(df.columns)
@@ -406,17 +406,17 @@ def get_colored_excel_bytes(df):
             elif val == "出":
                 cell.fill = fill_work
 
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output.getvalue()
+    out_stream = io.BytesIO()
+    wb.save(out_stream)
+    return out_stream.getvalue()
 
 
-# --- Streamlit メインアプリ ---
-st.title("📂 シフト自動作成アプリ")
+# --- Streamlit UI ---
+st.title("自動シフト作成システム")
 
 uploaded_file = st.file_uploader(
-    "シフト作成Excelファイルをアップロードしてください", type=["xlsx"]
+    "シフト作成用Excelファイルをアップロードしてください",
+    type=["xlsx", "xls"],
 )
 
 if uploaded_file is not None:
@@ -427,7 +427,7 @@ if uploaded_file is not None:
 
     col_map_days = {"月": 2, "火": 3, "水": 4, "木": 5, "金": 6, "土": 7, "日": 8}
     store_closed_days = []
-    is_holiday_open = True  # デフォルト営業
+    is_holiday_open = True
 
     if len(df_fix) > 5:
         for w_key, col_i in col_map_days.items():
@@ -441,7 +441,6 @@ if uploaded_file is not None:
             if is_batsu(val_j6):
                 is_holiday_open = False
 
-    # 必要人数の取得
     req_min = {
         "QUALIFIED_TOTAL": {w: 0 for w in WEEKDAYS_JP},
         "QUALIFIED_EARLY": {w: 0 for w in WEEKDAYS_JP},
@@ -492,7 +491,6 @@ if uploaded_file is not None:
                     except ValueError:
                         pass
 
-    # スタッフ一覧の読み込み
     header_row_idx = 15
     for idx, row in df_fix.iterrows():
         row_vals = [str(v).strip() for v in row.values if pd.notna(v)]
@@ -573,7 +571,6 @@ if uploaded_file is not None:
     excel_file.seek(0)
     df_cal = pd.read_excel(excel_file, sheet_name="カレンダー入力", header=None)
 
-    # H2セルから設定公休数の取得
     target_off_days = 9
     if len(df_cal) > 1 and len(df_cal.columns) > 7:
         val_h2 = df_cal.iloc[1, 7]
@@ -639,37 +636,36 @@ if uploaded_file is not None:
     jp_holidays_set = get_japanese_holidays(dates_list)
 
     if dates_list:
-        st.info(
-            f"📌 カレンダー入力H2から取得した設定公休数: {target_off_days}日 | "
-            f"店舗定休日: {store_closed_days if store_closed_days else 'なし'} | "
-            f"祝日営業設定: {'営業' if is_holiday_open else '休業'}"
-        )
+        st.info(f"設定公休数: {target_off_days}日")
+        st.info(f"店舗定休日: {store_closed_days if store_closed_days else 'なし'}")
+        st.info(f"祝日営業設定: {'営業' if is_holiday_open else '休業'}")
 
-        with st.spinner("⚙️ シフト自動生成を実行中..."):
-            result_df = generate_shift(
-                dates_list,
-                req_min,
-                staff_info,
-                holiday_requests,
-                extra_work,
-                store_closed_days,
-                is_holiday_open,
-                jp_holidays_set,
-                target_off_days,
-            )
+        if st.button("シフト自動生成を開始"):
+            with st.spinner("シフトを生成中..."):
+                result_df = generate_shift(
+                    dates_list,
+                    req_min,
+                    staff_info,
+                    holiday_requests,
+                    extra_work,
+                    store_closed_days,
+                    is_holiday_open,
+                    jp_holidays_set,
+                    target_off_days,
+                )
 
-        if result_df is not None:
-            st.success("🎉 シフト表の作成が完了しました！")
-            st.dataframe(result_df)
+            if result_df is not None:
+                st.success("🎉 シフト表の作成が完了しました！")
+                st.dataframe(result_df)
 
-            out_name = f"完成シフト表_{dates_list[0]}_{dates_list[-1]}.xlsx"
-            excel_data = get_colored_excel_bytes(result_df)
+                excel_data = create_colored_excel_bytes(result_df)
+                out_name = f"完成シフト表_{dates_list[0]}_{dates_list[-1]}.xlsx"
 
-            st.download_button(
-                label="📥 完成したExcelファイルをダウンロード",
-                data=excel_data,
-                file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        else:
-            st.error("条件を満たすシフトが見つかりませんでした。")
+                st.download_button(
+                    label="Excelファイルをダウンロード",
+                    data=excel_data,
+                    file_name=out_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            else:
+                st.error("条件を満たすシフトを作成できませんでした。")
