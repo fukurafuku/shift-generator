@@ -1,10 +1,22 @@
 from datetime import date, datetime
 import io
+import holidays
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill
 from ortools.sat.python import cp_model
 import pandas as pd
 import streamlit as st
 
 WEEKDAYS_JP = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+# --- 日本の祝日取得ユーティリティ ---
+def get_japanese_holidays(dates):
+    if not dates:
+        return set()
+    years = sorted(set(d.year for d in dates))
+    jp_holidays = holidays.JP(years=years)
+    return {d for d in dates if d in jp_holidays}
 
 
 # --- 柔軟な文字判定ユーティリティ ---
@@ -55,6 +67,9 @@ def generate_shift(
     staff_info,
     holiday_requests,
     extra_work,
+    store_closed_days,  # 店舗定休日（曜日リスト）
+    is_holiday_open,  # 祝日営業フラグ (True/False)
+    jp_holidays_set,  # 祝日日付の集合
     target_off_days=9,
 ):
     model = cp_model.CpModel()
@@ -78,12 +93,23 @@ def generate_shift(
     for d in dates_list:
         d_str = d.strftime("%Y-%m-%d")
         w_jp = WEEKDAYS_JP[d.weekday()]
+        is_holiday = d in jp_holidays_set
+
+        # 店舗定休日チェック（定休日、または祝日営業でない日の祝日）
+        is_store_closed = (w_jp in store_closed_days) or (
+            is_holiday and not is_holiday_open
+        )
 
         for s in staffs:
             info = staff_info[s]
             is_holiday_req = s in holiday_requests.get(d_str, [])
             is_extra = s in extra_work.get(d_str, [])
             is_fixed_off = w_jp in info["off_weekdays"]
+
+            # 店舗休業日の場合は全員必ず公休
+            if is_store_closed:
+                model.Add(x[(s, d_str, "公休")] == 1)
+                continue
 
             # 1. 研修の判定（カレンダーで指定された場合のみ「研」、それ以外は「研」を禁止）
             if is_extra:
@@ -115,7 +141,7 @@ def generate_shift(
                 == target_off_days
             )
 
-    # 最低必要人数の確保（最低ラインであり上限なし）
+    # 最低必要人数の確保（店舗営業日のみカウント）
     shortage_q_tot, shortage_q_early, shortage_q_late, shortage_unq = (
         {},
         {},
@@ -126,12 +152,24 @@ def generate_shift(
     for d in dates_list:
         d_str = d.strftime("%Y-%m-%d")
         w_jp = WEEKDAYS_JP[d.weekday()]
+        is_holiday = d in jp_holidays_set
+        is_store_closed = (w_jp in store_closed_days) or (
+            is_holiday and not is_holiday_open
+        )
 
         q_staffs = [s for s in staffs if staff_info[s]["is_qualified"]]
         unq_staffs = [s for s in staffs if not staff_info[s]["is_qualified"]]
 
-        # 資格者合計（最低値）
-        req_qt = req_min["QUALIFIED_TOTAL"].get(w_jp, 0)
+        if is_store_closed:
+            # 店舗休業日は必要人数0で固定
+            req_qt, req_qe, req_ql, req_u = 0, 0, 0, 0
+        else:
+            req_qt = req_min["QUALIFIED_TOTAL"].get(w_jp, 0)
+            req_qe = req_min["QUALIFIED_EARLY"].get(w_jp, 0)
+            req_ql = req_min["QUALIFIED_LATE"].get(w_jp, 0)
+            req_u = req_min["UNQUALIFIED"].get(w_jp, 0)
+
+        # 資格者合計
         sqt = model.NewIntVar(0, req_qt, f"sqt_{d_str}")
         model.Add(
             sum(
@@ -144,20 +182,17 @@ def generate_shift(
         )
         shortage_q_tot[d_str] = sqt
 
-        # 資格者早番（最低値）
-        req_qe = req_min["QUALIFIED_EARLY"].get(w_jp, 0)
+        # 資格者早番
         sqe = model.NewIntVar(0, req_qe, f"sqe_{d_str}")
         model.Add(sum(x[(s, d_str, "早")] for s in q_staffs) + sqe >= req_qe)
         shortage_q_early[d_str] = sqe
 
-        # 資格者遅番（最低値）
-        req_ql = req_min["QUALIFIED_LATE"].get(w_jp, 0)
+        # 資格者遅番
         sql = model.NewIntVar(0, req_ql, f"sql_{d_str}")
         model.Add(sum(x[(s, d_str, "遅")] for s in q_staffs) + sql >= req_ql)
         shortage_q_late[d_str] = sql
 
-        # 一般スタッフ（最低値）
-        req_u = req_min["UNQUALIFIED"].get(w_jp, 0)
+        # 一般スタッフ
         su = model.NewIntVar(0, req_u, f"su_{d_str}")
         model.Add(
             sum(
@@ -169,6 +204,28 @@ def generate_shift(
             >= req_u
         )
         shortage_unq[d_str] = su
+
+    # 一般スタッフが0人の日に対するペナルティ判定
+    zero_unq_days = []
+    unq_staffs = [s for s in staffs if not staff_info[s]["is_qualified"]]
+    if unq_staffs:
+        for d in dates_list:
+            d_str = d.strftime("%Y-%m-%d")
+            w_jp = WEEKDAYS_JP[d.weekday()]
+            is_holiday = d in jp_holidays_set
+            is_store_closed = (w_jp in store_closed_days) or (
+                is_holiday and not is_holiday_open
+            )
+            if not is_store_closed:
+                is_zero = model.NewBoolVar(f"zero_unq_{d_str}")
+                unq_work_count = sum(
+                    x[(s, d_str, sh)]
+                    for s in unq_staffs
+                    for sh in ["早", "遅", "出"]
+                )
+                model.Add(unq_work_count >= 1).OnlyEnforceIf(is_zero.Not())
+                model.Add(unq_work_count == 0).OnlyEnforceIf(is_zero)
+                zero_unq_days.append(is_zero)
 
     # 連続勤務超過ペナルティ
     over_consec = {}
@@ -191,11 +248,10 @@ def generate_shift(
                 )
                 over_consec[(s, window[-1])] = ov
 
-    # 土日両方出勤ペナルティ（優先調整ルール）
+    # 土日両方出勤ペナルティ
     weekend_both_work = []
-    # 日付リストの中から「土曜日」を探し、翌日（日曜日）も対象期間に含まれるか判定
     for i, d in enumerate(dates_list):
-        if d.weekday() == 5:  # 土曜日
+        if d.weekday() == 5:
             if (
                 i + 1 < len(dates_list) and dates_list[i + 1].weekday() == 6
             ):  # 日曜日
@@ -203,19 +259,13 @@ def generate_shift(
                 d_sun_str = dates_list[i + 1].strftime("%Y-%m-%d")
 
                 for s in staffs:
-                    # 土曜・日曜の両方の出勤状態を表すブール変数（1なら両方出勤）
                     both_v = model.NewBoolVar(f"both_weekend_{s}_{d_sat_str}")
-
-                    # 土曜日の出勤判定（早, 遅, 出, 研）
                     sat_work = sum(
                         x[(s, d_sat_str, sh)] for sh in ["早", "遅", "出", "研"]
                     )
-                    # 日曜日の出勤判定（早, 遅, 出, 研）
                     sun_work = sum(
                         x[(s, d_sun_str, sh)] for sh in ["早", "遅", "出", "研"]
                     )
-
-                    # 土日両方出勤の場合のみ both_v == 1 にできる制約
                     model.Add(sat_work + sun_work <= 1 + both_v)
                     weekend_both_work.append(both_v)
 
@@ -234,10 +284,11 @@ def generate_shift(
     )
     penalty_consec = sum(over_consec.values())
     penalty_weekend = sum(weekend_both_work)
+    penalty_zero_unq = sum(zero_unq_days)
 
-    # 目的関数の最適化（人数不足1000 > 連勤超過10 > 土日両方出勤5 > 有休使用1）
     model.Minimize(
         penalty_shortage * 1000
+        + penalty_zero_unq * 5
         + penalty_consec * 10
         + penalty_weekend * 5
         + total_paid_leaves
@@ -311,21 +362,86 @@ def generate_shift(
     return None
 
 
-# --- Streamlit UI ---
-st.title("自動シフト作成アプリ")
+# --- 装飾付きExcelバイナリ生成関数（Streamlitダウンロード用） ---
+def get_colored_excel_bytes(df):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "シフト表"
+
+    # 色の定義
+    fill_early = PatternFill(
+        start_color="FFE6CC", end_color="FFE6CC", fill_type="solid"
+    )  # 薄いオレンジ（早）
+    fill_late = PatternFill(
+        start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"
+    )  # 薄い紺/ソフトブルー（遅）
+    fill_work = PatternFill(
+        start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"
+    )  # 薄い緑（出）
+
+    # ヘッダー書き込み
+    headers = ["スタッフ / 日付"] + list(df.columns)
+    ws.append(headers)
+
+    # データ書き込み＆色付け
+    for index, row in df.iterrows():
+        row_data = [index] + list(row.values)
+        ws.append(row_data)
+
+    for r_idx, row in enumerate(
+        ws.iter_rows(
+            min_row=2,
+            max_row=len(df) + 1,
+            min_col=2,
+            max_col=len(df.columns) + 1,
+        ),
+        start=0,
+    ):
+        for c_idx, cell in enumerate(row):
+            val = str(cell.value).strip() if cell.value is not None else ""
+            if val == "早":
+                cell.fill = fill_early
+            elif val == "遅":
+                cell.fill = fill_late
+            elif val == "出":
+                cell.fill = fill_work
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+# --- Streamlit メインアプリ ---
+st.title("📂 シフト自動作成アプリ")
 
 uploaded_file = st.file_uploader(
-    "📂 シフト作成Excelファイルをアップロードしてください",
-    type=["xlsx", "xls"],
+    "シフト作成Excelファイルをアップロードしてください", type=["xlsx"]
 )
 
 if uploaded_file is not None:
-    excel_bytes = uploaded_file.read()
-    excel_file = io.BytesIO(excel_bytes)
+    excel_file = io.BytesIO(uploaded_file.read())
 
     # 1. 固定ルールシートの読み取り
     df_fix = pd.read_excel(excel_file, sheet_name="固定ルール", header=None)
-    col_map = {"月": 2, "火": 3, "水": 4, "木": 5, "金": 6, "土": 7, "日": 8}
+
+    col_map_days = {"月": 2, "火": 3, "水": 4, "木": 5, "金": 6, "土": 7, "日": 8}
+    store_closed_days = []
+    is_holiday_open = True  # デフォルト営業
+
+    if len(df_fix) > 5:
+        for w_key, col_i in col_map_days.items():
+            if col_i < len(df_fix.columns):
+                val = df_fix.iloc[5, col_i]
+                if is_batsu(val):
+                    store_closed_days.append(w_key)
+
+        if len(df_fix.columns) > 9:
+            val_j6 = df_fix.iloc[5, 9]
+            if is_batsu(val_j6):
+                is_holiday_open = False
+
+    # 必要人数の取得
     req_min = {
         "QUALIFIED_TOTAL": {w: 0 for w in WEEKDAYS_JP},
         "QUALIFIED_EARLY": {w: 0 for w in WEEKDAYS_JP},
@@ -340,7 +456,7 @@ if uploaded_file is not None:
             else ""
         )
         if "資格者合計" in label:
-            for w_key, col_i in col_map.items():
+            for w_key, col_i in col_map_days.items():
                 if col_i < len(df_fix.columns) and pd.notna(df_fix.iloc[r, col_i]):
                     try:
                         req_min["QUALIFIED_TOTAL"][w_key] = int(
@@ -349,7 +465,7 @@ if uploaded_file is not None:
                     except ValueError:
                         pass
         elif "うち資格者早番" in label:
-            for w_key, col_i in col_map.items():
+            for w_key, col_i in col_map_days.items():
                 if col_i < len(df_fix.columns) and pd.notna(df_fix.iloc[r, col_i]):
                     try:
                         req_min["QUALIFIED_EARLY"][w_key] = int(
@@ -358,7 +474,7 @@ if uploaded_file is not None:
                     except ValueError:
                         pass
         elif "うち資格者遅番" in label:
-            for w_key, col_i in col_map.items():
+            for w_key, col_i in col_map_days.items():
                 if col_i < len(df_fix.columns) and pd.notna(df_fix.iloc[r, col_i]):
                     try:
                         req_min["QUALIFIED_LATE"][w_key] = int(
@@ -367,7 +483,7 @@ if uploaded_file is not None:
                     except ValueError:
                         pass
         elif "一般スタッフ" in label:
-            for w_key, col_i in col_map.items():
+            for w_key, col_i in col_map_days.items():
                 if col_i < len(df_fix.columns) and pd.notna(df_fix.iloc[r, col_i]):
                     try:
                         req_min["UNQUALIFIED"][w_key] = int(
@@ -376,6 +492,7 @@ if uploaded_file is not None:
                     except ValueError:
                         pass
 
+    # スタッフ一覧の読み込み
     header_row_idx = 15
     for idx, row in df_fix.iterrows():
         row_vals = [str(v).strip() for v in row.values if pd.notna(v)]
@@ -404,6 +521,7 @@ if uploaded_file is not None:
         s_val = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
         if not s_val or s_val in ["nan", "None", "", "スタッフ名", "名前", "氏名"]:
             continue
+
         s_id = (
             maru_symbols[idx_count]
             if idx_count < len(maru_symbols)
@@ -455,7 +573,8 @@ if uploaded_file is not None:
     excel_file.seek(0)
     df_cal = pd.read_excel(excel_file, sheet_name="カレンダー入力", header=None)
 
-    target_off_days = 9  # フォールバック用デフォルト値
+    # H2セルから設定公休数の取得
+    target_off_days = 9
     if len(df_cal) > 1 and len(df_cal.columns) > 7:
         val_h2 = df_cal.iloc[1, 7]
         if pd.notna(val_h2):
@@ -464,20 +583,29 @@ if uploaded_file is not None:
             except ValueError:
                 pass
 
-    holiday_requests, extra_work, dates_list = {}, {}, []
-    staff_cols = {
-        "①": 5,
-        "②": 6,
-        "③": 7,
-        "④": 8,
-        "⑤": 9,
-        "⑥": 10,
-        "⑦": 11,
-        "⑧": 12,
-        "⑨": 13,
-    }
+    dynamic_staff_cols = {}
+    cal_header_row = 4
+    for r in range(2, 6):
+        if r < len(df_cal):
+            row_vals = [
+                str(v).strip() for v in df_cal.iloc[r].values if pd.notna(v)
+            ]
+            if any(s_id in row_vals for s_id in staff_info.keys()):
+                cal_header_row = r
+                break
 
-    for r in range(5, len(df_cal)):
+    for c in range(len(df_cal.columns)):
+        val = (
+            str(df_cal.iloc[cal_header_row, c]).strip()
+            if pd.notna(df_cal.iloc[cal_header_row, c])
+            else ""
+        )
+        if val in staff_info:
+            dynamic_staff_cols[val] = c
+
+    holiday_requests, extra_work, dates_list = {}, {}, []
+
+    for r in range(cal_header_row + 1, len(df_cal)):
         d_val = df_cal.iloc[r, 3]
         if pd.isna(d_val) or str(d_val).strip() in ["", "nan", "None"]:
             continue
@@ -495,7 +623,7 @@ if uploaded_file is not None:
         holiday_requests[d_str] = []
         extra_work[d_str] = []
 
-        for s_id, col_idx in staff_cols.items():
+        for s_id, col_idx in dynamic_staff_cols.items():
             if col_idx < len(df_cal.columns):
                 cell_val = (
                     str(df_cal.iloc[r, col_idx]).strip()
@@ -508,38 +636,40 @@ if uploaded_file is not None:
                     extra_work[d_str].append(s_id)
 
     dates_list = sorted(list(set(dates_list)))
+    jp_holidays_set = get_japanese_holidays(dates_list)
 
     if dates_list:
-        st.info(f"📌 カレンダー入力H2から取得した設定公休数: {target_off_days}日")
+        st.info(
+            f"📌 カレンダー入力H2から取得した設定公休数: {target_off_days}日 | "
+            f"店舗定休日: {store_closed_days if store_closed_days else 'なし'} | "
+            f"祝日営業設定: {'営業' if is_holiday_open else '休業'}"
+        )
 
-        if st.button("⚙️ シフト自動生成を実行"):
-            with st.spinner("シフトを計算中..."):
-                result_df = generate_shift(
-                    dates_list,
-                    req_min,
-                    staff_info,
-                    holiday_requests,
-                    extra_work,
-                    target_off_days,
-                )
+        with st.spinner("⚙️ シフト自動生成を実行中..."):
+            result_df = generate_shift(
+                dates_list,
+                req_min,
+                staff_info,
+                holiday_requests,
+                extra_work,
+                store_closed_days,
+                is_holiday_open,
+                jp_holidays_set,
+                target_off_days,
+            )
 
-            if result_df is not None:
-                st.success("🎉 シフト表の作成が完了しました！")
-                st.dataframe(result_df)
+        if result_df is not None:
+            st.success("🎉 シフト表の作成が完了しました！")
+            st.dataframe(result_df)
 
-                # Excel出力用データ変換
-                out_name = f"完成シフト表_{dates_list[0]}_{dates_list[-1]}.xlsx"
-                excel_buffer = io.BytesIO()
-                result_df.to_excel(excel_buffer, index=True)
-                excel_buffer.seek(0)
+            out_name = f"完成シフト表_{dates_list[0]}_{dates_list[-1]}.xlsx"
+            excel_data = get_colored_excel_bytes(result_df)
 
-                st.download_button(
-                    label="📥 完成シフト表をダウンロード",
-                    data=excel_buffer,
-                    file_name=out_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            else:
-                st.error(
-                    "❌ シフトを作成できませんでした。制約条件を見直してください。"
-                )
+            st.download_button(
+                label="📥 完成したExcelファイルをダウンロード",
+                data=excel_data,
+                file_name=out_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.error("条件を満たすシフトが見つかりませんでした。")
