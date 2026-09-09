@@ -1,5 +1,6 @@
-streamlit
+Plaintext
 ortools
 holidays
 openpyxl
 pandas
+streamlit
