@@ -1,6 +1,5 @@
-Plaintext
-ortools
-holidays
-openpyxl
-pandas
 streamlit
+pandas
+openpyxl
+holidays
+ortools
